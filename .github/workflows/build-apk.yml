@@ -1,0 +1,752 @@
+name: Build Jarvis APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Abrir o zip (se voce enviou o projeto zipado)
+        run: |
+          shopt -s nullglob
+          for z in *.zip; do
+            echo "Abrindo $z"
+            unzip -o -q "$z" -d _projeto
+          done
+
+      - name: Localizar o projeto
+        run: |
+          CFG=$(find . -maxdepth 4 -name capacitor.config.json -not -path "*/node_modules/*" | head -n 1)
+          if [ -z "$CFG" ]; then
+            echo "::error::Nao achei o arquivo capacitor.config.json no repositorio. Envie capacitor.config.json, package.json e a pasta www."
+            find . -maxdepth 3 -not -path "./.git/*" | head -50
+            exit 1
+          fi
+          DIR=$(dirname "$CFG")
+          echo "APP_DIR=$DIR" >> "$GITHUB_ENV"
+          echo "Projeto encontrado em: $DIR"
+          for f in package.json www/index.html; do
+            if [ ! -f "$DIR/$f" ]; then
+              echo "::error::Falta o arquivo $DIR/$f. Envie de novo a pasta www e o package.json."
+              exit 1
+            fi
+          done
+          if [ ! -d "$DIR/icons" ]; then echo "Aviso: pasta icons ausente; sera usado o icone padrao."; fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Guardar downloads do Gradle (acelera as proximas montagens)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-cap6-v1
+
+      - name: Instalar dependencias
+        working-directory: ${{ env.APP_DIR }}
+        run: npm install --no-audit --no-fund --legacy-peer-deps
+
+      - name: Criar projeto Android
+        working-directory: ${{ env.APP_DIR }}
+        run: npx cap add android
+
+      - name: Permissoes, assistente e plugin nativo
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          MAN=android/app/src/main/AndroidManifest.xml
+          cat > perms.txt <<'PERMS'
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.READ_CONTACTS" />
+              <uses-permission android:name="android.permission.SEND_SMS" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+              <uses-permission android:name="android.permission.READ_CALENDAR" />
+              <uses-permission android:name="android.permission.CALL_PHONE" />
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+          PERMS
+          sed -i '/android.permission.INTERNET/r perms.txt' "$MAN"
+          cat > assist.txt <<'ASSIST'
+                  <intent-filter>
+                      <action android:name="android.intent.action.ASSIST" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                  </intent-filter>
+                  <intent-filter>
+                      <action android:name="android.intent.action.VOICE_COMMAND" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                  </intent-filter>
+          ASSIST
+          python3 - <<'PYX'
+          p='android/app/src/main/AndroidManifest.xml'
+          s=open(p).read()
+          block=open('assist.txt').read()
+          i=s.index('</activity>')
+          s=s[:i]+block+s[i:]
+          k=s.index('</application>')
+          s=s[:k]+'    <service android:name=".JarvisService" android:exported="false" android:foregroundServiceType="microphone" />\n    '+s[k:]
+          open(p,'w').write(s)
+          PYX
+          grep -c "action.ASSIST" "$MAN"
+          DIR=android/app/src/main/java/com/pessoal/jarvis
+          mkdir -p "$DIR"
+          cat > "$DIR/AppControlPlugin.java" <<'JAVA'
+          package com.pessoal.jarvis;
+
+          import android.Manifest;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.hardware.camera2.CameraCharacteristics;
+          import android.hardware.camera2.CameraManager;
+          import android.media.AudioManager;
+          import android.provider.AlarmClock;
+          import android.provider.CalendarContract;
+          import android.view.KeyEvent;
+          import android.database.Cursor;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.provider.ContactsContract;
+          import android.telephony.SmsManager;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.PermissionState;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import com.getcapacitor.annotation.PermissionCallback;
+          import androidx.biometric.BiometricManager;
+          import androidx.biometric.BiometricPrompt;
+          import androidx.core.content.ContextCompat;
+          import androidx.fragment.app.FragmentActivity;
+          import java.util.ArrayList;
+          import java.util.concurrent.Executor;
+
+          @CapacitorPlugin(
+              name = "AppControl",
+              permissions = {
+                  @Permission(strings = { Manifest.permission.READ_CONTACTS }, alias = "contacts"),
+                  @Permission(strings = { Manifest.permission.SEND_SMS }, alias = "sms"),
+                  @Permission(strings = { Manifest.permission.READ_CALENDAR }, alias = "calendar"),
+                  @Permission(strings = { Manifest.permission.CALL_PHONE }, alias = "call")
+              }
+          )
+          public class AppControlPlugin extends Plugin {
+
+              @PluginMethod
+              public void launch(PluginCall call) {
+                  String pkg = call.getString("package");
+                  Intent i = getContext().getPackageManager().getLaunchIntentForPackage(pkg);
+                  if (i == null) { call.reject("not installed"); return; }
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  getContext().startActivity(i);
+                  call.resolve();
+              }
+
+              @PluginMethod
+              public void action(PluginCall call) {
+                  try {
+                      Intent i = new Intent(call.getString("action"));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void open(PluginCall call) {
+                  try {
+                      Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(call.getString("url")));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void getContacts(PluginCall call) {
+                  if (getPermissionState("contacts") != PermissionState.GRANTED) {
+                      requestPermissionForAlias("contacts", call, "contactsCb");
+                      return;
+                  }
+                  doContacts(call);
+              }
+
+              @PermissionCallback
+              private void contactsCb(PluginCall call) {
+                  if (getPermissionState("contacts") == PermissionState.GRANTED) doContacts(call);
+                  else call.reject("denied");
+              }
+
+              private void doContacts(PluginCall call) {
+                  JSArray arr = new JSArray();
+                  Cursor c = getContext().getContentResolver().query(
+                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                      new String[] {
+                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                          ContactsContract.CommonDataKinds.Phone.NUMBER
+                      },
+                      null, null,
+                      ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME + " ASC");
+                  if (c != null) {
+                      while (c.moveToNext() && arr.length() < 5000) {
+                          JSObject o = new JSObject();
+                          o.put("n", c.getString(0));
+                          o.put("t", c.getString(1));
+                          arr.put(o);
+                      }
+                      c.close();
+                  }
+                  JSObject r = new JSObject();
+                  r.put("contacts", arr);
+                  call.resolve(r);
+              }
+
+              @PluginMethod
+              public void sendSms(PluginCall call) {
+                  if (getPermissionState("sms") != PermissionState.GRANTED) {
+                      requestPermissionForAlias("sms", call, "smsCb");
+                      return;
+                  }
+                  doSms(call);
+              }
+
+              @PermissionCallback
+              private void smsCb(PluginCall call) {
+                  if (getPermissionState("sms") == PermissionState.GRANTED) doSms(call);
+                  else call.reject("denied");
+              }
+
+              private void doSms(PluginCall call) {
+                  try {
+                      SmsManager sm = Build.VERSION.SDK_INT >= 31
+                          ? getContext().getSystemService(SmsManager.class)
+                          : SmsManager.getDefault();
+                      ArrayList<String> parts = sm.divideMessage(call.getString("text"));
+                      sm.sendMultipartTextMessage(call.getString("to"), null, parts, null, null);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void background(PluginCall call) {
+                  boolean on = Boolean.TRUE.equals(call.getBoolean("on", false));
+                  try {
+                      Intent i = new Intent(getContext(), JarvisService.class);
+                      if (on) {
+                          if (Build.VERSION.SDK_INT >= 26) getContext().startForegroundService(i);
+                          else getContext().startService(i);
+                      } else {
+                          getContext().stopService(i);
+                      }
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void authenticate(final PluginCall call) {
+                  getActivity().runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              Executor ex = ContextCompat.getMainExecutor(getContext());
+                              BiometricPrompt bp = new BiometricPrompt((FragmentActivity) getActivity(), ex,
+                                  new BiometricPrompt.AuthenticationCallback() {
+                                      @Override
+                                      public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                                          call.resolve();
+                                      }
+                                      @Override
+                                      public void onAuthenticationError(int errorCode, CharSequence errString) {
+                                          call.reject("denied");
+                                      }
+                                  });
+                              BiometricPrompt.PromptInfo.Builder b = new BiometricPrompt.PromptInfo.Builder()
+                                  .setTitle("Jarvis")
+                                  .setSubtitle(call.getString("reason", "Confirme que e voce"));
+                              if (Build.VERSION.SDK_INT >= 30) {
+                                  b.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG
+                                      | BiometricManager.Authenticators.DEVICE_CREDENTIAL);
+                              } else {
+                                  b.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+                                   .setNegativeButtonText("Cancelar");
+                              }
+                              bp.authenticate(b.build());
+                          } catch (Exception e) { call.reject("failed"); }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void alarm(PluginCall call) {
+                  try {
+                      int hour = call.getInt("hour", 7);
+                      int minute = call.getInt("minute", 0);
+                      Intent i = new Intent(AlarmClock.ACTION_SET_ALARM)
+                          .putExtra(AlarmClock.EXTRA_HOUR, hour)
+                          .putExtra(AlarmClock.EXTRA_MINUTES, minute)
+                          .putExtra(AlarmClock.EXTRA_MESSAGE, call.getString("message", "Jarvis"))
+                          .putExtra(AlarmClock.EXTRA_SKIP_UI, true);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void torch(PluginCall call) {
+                  try {
+                      CameraManager cm = (CameraManager) getContext().getSystemService(Context.CAMERA_SERVICE);
+                      boolean on = Boolean.TRUE.equals(call.getBoolean("on", true));
+                      for (String id : cm.getCameraIdList()) {
+                          CameraCharacteristics cc = cm.getCameraCharacteristics(id);
+                          Boolean flash = cc.get(CameraCharacteristics.FLASH_INFO_AVAILABLE);
+                          Integer facing = cc.get(CameraCharacteristics.LENS_FACING);
+                          if (flash != null && flash && facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+                              cm.setTorchMode(id, on);
+                              call.resolve();
+                              return;
+                          }
+                      }
+                      call.reject("no flash");
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void volume(PluginCall call) {
+                  try {
+                      AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+                      String act = call.getString("action", "set");
+                      int max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                      if ("up".equals(act)) {
+                          am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI);
+                      } else if ("down".equals(act)) {
+                          am.adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI);
+                      } else if ("mute".equals(act)) {
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, AudioManager.FLAG_SHOW_UI);
+                      } else {
+                          int pct = call.getInt("level", 50);
+                          am.setStreamVolume(AudioManager.STREAM_MUSIC, Math.round(max * pct / 100f), AudioManager.FLAG_SHOW_UI);
+                      }
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void media(PluginCall call) {
+                  try {
+                      String k = call.getString("key", "playpause");
+                      int code = KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE;
+                      if ("next".equals(k)) code = KeyEvent.KEYCODE_MEDIA_NEXT;
+                      else if ("prev".equals(k)) code = KeyEvent.KEYCODE_MEDIA_PREVIOUS;
+                      else if ("stop".equals(k)) code = KeyEvent.KEYCODE_MEDIA_STOP;
+                      else if ("play".equals(k)) code = KeyEvent.KEYCODE_MEDIA_PLAY;
+                      else if ("pause".equals(k)) code = KeyEvent.KEYCODE_MEDIA_PAUSE;
+                      AudioManager am = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+                      am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_DOWN, code));
+                      am.dispatchMediaKeyEvent(new KeyEvent(KeyEvent.ACTION_UP, code));
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void dial(PluginCall call) {
+                  if (getPermissionState("call") != PermissionState.GRANTED) {
+                      requestPermissionForAlias("call", call, "dialCb");
+                      return;
+                  }
+                  doDial(call);
+              }
+
+              @PermissionCallback
+              private void dialCb(PluginCall call) {
+                  if (getPermissionState("call") == PermissionState.GRANTED) doDial(call);
+                  else call.reject("denied");
+              }
+
+              private void doDial(PluginCall call) {
+                  try {
+                      Intent i = new Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(call.getString("number"))));
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void calendar(PluginCall call) {
+                  if (getPermissionState("calendar") != PermissionState.GRANTED) {
+                      if (Boolean.TRUE.equals(call.getBoolean("silent", false))) { call.reject("denied"); return; }
+                      requestPermissionForAlias("calendar", call, "calendarCb");
+                      return;
+                  }
+                  doCalendar(call);
+              }
+
+              @PermissionCallback
+              private void calendarCb(PluginCall call) {
+                  if (getPermissionState("calendar") == PermissionState.GRANTED) doCalendar(call);
+                  else call.reject("denied");
+              }
+
+              private void doCalendar(PluginCall call) {
+                  try {
+                      int days = call.getInt("days", 1);
+                      java.util.Calendar c = java.util.Calendar.getInstance();
+                      c.set(java.util.Calendar.HOUR_OF_DAY, 0);
+                      c.set(java.util.Calendar.MINUTE, 0);
+                      c.set(java.util.Calendar.SECOND, 0);
+                      c.set(java.util.Calendar.MILLISECOND, 0);
+                      long start = c.getTimeInMillis();
+                      long end = start + days * 24L * 3600L * 1000L;
+                      Cursor cur = CalendarContract.Instances.query(
+                          getContext().getContentResolver(),
+                          new String[] {
+                              CalendarContract.Instances.TITLE,
+                              CalendarContract.Instances.BEGIN,
+                              CalendarContract.Instances.END,
+                              CalendarContract.Instances.EVENT_LOCATION,
+                              CalendarContract.Instances.ALL_DAY
+                          },
+                          start, end);
+                      JSArray arr = new JSArray();
+                      if (cur != null) {
+                          while (cur.moveToNext() && arr.length() < 60) {
+                              JSObject o = new JSObject();
+                              o.put("title", cur.getString(0));
+                              o.put("begin", cur.getLong(1));
+                              o.put("end", cur.getLong(2));
+                              o.put("where", cur.getString(3));
+                              o.put("allDay", cur.getInt(4) == 1);
+                              arr.put(o);
+                          }
+                          cur.close();
+                      }
+                      JSObject r = new JSObject();
+                      r.put("events", arr);
+                      call.resolve(r);
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+
+              @PluginMethod
+              public void addEvent(PluginCall call) {
+                  try {
+                      long begin = call.getData().optLong("begin", System.currentTimeMillis() + 3600000L);
+                      Intent i = new Intent(Intent.ACTION_INSERT)
+                          .setData(CalendarContract.Events.CONTENT_URI)
+                          .putExtra(CalendarContract.Events.TITLE, call.getString("title", "Compromisso"))
+                          .putExtra(CalendarContract.Events.EVENT_LOCATION, call.getString("where", ""))
+                          .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, begin)
+                          .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, begin + 3600000L);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      getContext().startActivity(i);
+                      call.resolve();
+                  } catch (Exception e) { call.reject("failed"); }
+              }
+          }
+          JAVA
+          cat > "$DIR/SpeechPlugin.java" <<'JAVA'
+          package com.pessoal.jarvis;
+
+          import android.Manifest;
+          import android.content.Intent;
+          import android.os.Bundle;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import com.getcapacitor.JSArray;
+          import com.getcapacitor.JSObject;
+          import com.getcapacitor.Plugin;
+          import com.getcapacitor.PluginCall;
+          import com.getcapacitor.PluginMethod;
+          import com.getcapacitor.annotation.CapacitorPlugin;
+          import com.getcapacitor.annotation.Permission;
+          import java.util.ArrayList;
+
+          @CapacitorPlugin(
+              name = "SpeechRecognition",
+              permissions = {
+                  @Permission(strings = { Manifest.permission.RECORD_AUDIO }, alias = "speechRecognition")
+              }
+          )
+          public class SpeechPlugin extends Plugin {
+              private SpeechRecognizer sr;
+
+              private void emitMatches(ArrayList<String> r) {
+                  if (r == null || r.isEmpty()) return;
+                  JSArray arr = new JSArray();
+                  for (String s : r) arr.put(s);
+                  JSObject o = new JSObject();
+                  o.put("matches", arr);
+                  notifyListeners("partialResults", o);
+              }
+
+              private void emitState(String st) {
+                  JSObject o = new JSObject();
+                  o.put("status", st);
+                  notifyListeners("listeningState", o);
+              }
+
+              @PluginMethod
+              public void start(final PluginCall call) {
+                  if (!SpeechRecognizer.isRecognitionAvailable(getContext())) {
+                      call.reject("unavailable");
+                      return;
+                  }
+                  final String lang = call.getString("language", "pt-BR");
+                  getActivity().runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try {
+                              if (sr != null) { sr.destroy(); sr = null; }
+                              sr = SpeechRecognizer.createSpeechRecognizer(getContext());
+                              sr.setRecognitionListener(new RecognitionListener() {
+                                  @Override public void onReadyForSpeech(Bundle params) { emitState("started"); }
+                                  @Override public void onBeginningOfSpeech() {}
+                                  @Override public void onRmsChanged(float rmsdB) {}
+                                  @Override public void onBufferReceived(byte[] buffer) {}
+                                  @Override public void onEndOfSpeech() {}
+                                  @Override public void onError(int error) { emitState("stopped"); }
+                                  @Override public void onResults(Bundle results) {
+                                      emitMatches(results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION));
+                                      emitState("stopped");
+                                  }
+                                  @Override public void onPartialResults(Bundle partialResults) {
+                                      emitMatches(partialResults.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION));
+                                  }
+                                  @Override public void onEvent(int eventType, Bundle params) {}
+                              });
+                              Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                              i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                              i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang);
+                              i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                              i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1);
+                              sr.startListening(i);
+                              call.resolve();
+                          } catch (Exception e) {
+                              call.reject("failed");
+                          }
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void stop(final PluginCall call) {
+                  getActivity().runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try { if (sr != null) sr.stopListening(); } catch (Exception e) {}
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @PluginMethod
+              public void cancel(final PluginCall call) {
+                  getActivity().runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          try { if (sr != null) sr.cancel(); } catch (Exception e) {}
+                          emitState("stopped");
+                          call.resolve();
+                      }
+                  });
+              }
+
+              @Override
+              protected void handleOnDestroy() {
+                  if (sr != null) {
+                      try { sr.destroy(); } catch (Exception e) {}
+                      sr = null;
+                  }
+                  super.handleOnDestroy();
+              }
+          }
+          JAVA
+          cat > "$DIR/JarvisService.java" <<'JAVA'
+          package com.pessoal.jarvis;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.content.pm.ServiceInfo;
+          import android.os.Build;
+          import android.os.IBinder;
+          import android.os.PowerManager;
+
+          public class JarvisService extends Service {
+              private static final String CH = "jarvis_bg";
+              private PowerManager.WakeLock wl;
+
+              @Override
+              public IBinder onBind(Intent intent) { return null; }
+
+              @Override
+              public int onStartCommand(Intent intent, int flags, int startId) {
+                  NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      nm.createNotificationChannel(new NotificationChannel(CH, "Jarvis em segundo plano", NotificationManager.IMPORTANCE_LOW));
+                  }
+                  Intent open = new Intent(this, MainActivity.class);
+                  open.setFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP);
+                  PendingIntent pi = PendingIntent.getActivity(this, 0, open, PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                  Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CH) : new Notification.Builder(this);
+                  Notification n = b.setContentTitle("Jarvis ativo")
+                      .setContentText("Ouvindo a palavra Jarvis")
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setContentIntent(pi)
+                      .setOngoing(true)
+                      .build();
+                  if (Build.VERSION.SDK_INT >= 29) startForeground(7, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE);
+                  else startForeground(7, n);
+                  if (wl == null) {
+                      PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                      wl = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "jarvis:bg");
+                      wl.acquire();
+                  }
+                  return START_STICKY;
+              }
+
+              @Override
+              public void onDestroy() {
+                  if (wl != null && wl.isHeld()) wl.release();
+                  super.onDestroy();
+              }
+          }
+          JAVA
+          cat > "$DIR/MainActivity.java" <<'JAVA'
+          package com.pessoal.jarvis;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(AppControlPlugin.class);
+                  registerPlugin(SpeechPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVA
+
+      - name: Icone e tela de abertura
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          RES=android/app/src/main/res
+          if [ -d icons ]; then cp -r icons/* "$RES/"; else echo "icons ausente: usando icone padrao"; fi
+          sed -i 's/#FFFFFF/#02060C/I' "$RES/values/ic_launcher_background.xml" || true
+          find "$RES" -name 'splash*.png' -delete
+          mkdir -p "$RES/drawable"
+          cat > "$RES/drawable/splash.xml" <<'SPL'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+              <solid android:color="#02060C" />
+          </shape>
+          SPL
+
+      - name: Dependencia de biometria
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          sed -i '0,/^dependencies {/s//dependencies {\n    implementation "androidx.biometric:biometric:1.1.0"/' android/app/build.gradle
+          grep -n "androidx.biometric" android/app/build.gradle
+
+      - name: Sincronizar
+        working-directory: ${{ env.APP_DIR }}
+        run: npx cap sync android
+
+      - name: Guardar assinatura entre versoes
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: jarvis-debug-keystore-v1
+
+      - name: Compilar APK (completo)
+        id: full
+        continue-on-error: true
+        working-directory: ${{ env.APP_DIR }}/android
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Plano B - compilar versao simples (so roda se a completa falhar)
+        if: steps.full.outcome == 'failure'
+        working-directory: ${{ env.APP_DIR }}
+        run: |
+          echo "::warning::A versao completa nao compilou. Montando a versao simples (sem digital, SMS, agenda e segundo plano). Copie o erro do passo 'Compilar APK (completo)' e me envie."
+          DIR=android/app/src/main/java/com/pessoal/jarvis
+          rm -f "$DIR/AppControlPlugin.java" "$DIR/JarvisService.java"
+          cat > "$DIR/MainActivity.java" <<'JAVA'
+          package com.pessoal.jarvis;
+
+          import android.os.Bundle;
+          import com.getcapacitor.BridgeActivity;
+
+          public class MainActivity extends BridgeActivity {
+              @Override
+              public void onCreate(Bundle savedInstanceState) {
+                  registerPlugin(SpeechPlugin.class);
+                  super.onCreate(savedInstanceState);
+              }
+          }
+          JAVA
+          python3 - <<'PYX'
+          import re
+          p='android/app/src/main/AndroidManifest.xml'
+          s=open(p).read()
+          s=re.sub(r'\s*<service android:name="\.JarvisService"[^>]*/>','',s)
+          open(p,'w').write(s)
+          PYX
+          sed -i '/androidx.biometric/d' android/app/build.gradle
+          echo "LITE=1" >> "$GITHUB_ENV"
+          cd android
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Conferir se o APK existe
+        run: |
+          APK="$APP_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "$APK" ]; then echo "::error::O APK nao foi gerado."; exit 1; fi
+          ls -la "$APK"
+
+      - name: Publicar APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: jarvis-${{ github.run_number }}
+          name: Jarvis ${{ github.run_number }}${{ env.LITE == '1' && ' (versao simples)' || '' }}
+          files: ${{ env.APP_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: jarvis-apk
+          path: ${{ env.APP_DIR }}/android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+
+      - name: Mostrar arquivos (ajuda a achar o problema)
+        if: failure()
+        run: |
+          echo "A montagem falhou. Veja acima o passo marcado em vermelho."
+          ls -R "$APP_DIR" 2>/dev/null | grep -v node_modules | head -80 || true
